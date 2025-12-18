@@ -1,0 +1,271 @@
+import cv2
+import numpy as np
+import torch
+import logging
+import redis
+import json
+from transformers import CLIPProcessor, CLIPModel
+import mediapipe as mp
+import os
+import threading
+from datetime import datetime, timedelta
+import time
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_PATH = os.path.join(BASE_DIR, "credentials", "node_0_token.json")
+
+with open(TOKEN_PATH, "r") as f:
+    TOKEN = json.load(f)["token"]
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler("node.log"),
+        logging.StreamHandler()
+    ]
+)
+
+try:
+    redis_client = redis.Redis(host='localhost', port=6382, db=0) # kad radimo s local serveron, port je 6380, ali kad pokušavamo gađat na server koji se pokrene kroz docker compose, port je 6382
+    redis_client.ping()
+    logging.info("Redis povezan uspjesno.")
+except redis.ConnectionError as e:
+    logging.error(f"Ne mogu se spojiti na Redis: {e}")
+    exit(1)
+
+NODE_ID = 1
+THRESHOLD_DISTANCE = float(os.getenv("THRESHOLD_DISTANCE", 0.2))
+THRESHOLD_TIME = timedelta(seconds=int(os.getenv("THRESHOLD_TIME_SECONDS", 30)))
+
+last_embedding_per_node = {}
+last_timestamp_per_node = {}
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logging.info(f"Koristi se device: {device}")
+processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+model.eval()
+
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=1,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+last_message = f"node {NODE_ID}: detection successful"
+last_message_lock = threading.Lock()
+
+
+# ==== Zamjena scipy cosine ====
+def cosine_distance(a, b):
+    a = np.asarray(a)
+    b = np.asarray(b)
+    # 1 - cosine similarity
+    return 1 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def segment_face(image_rgb):
+    small_rgb = cv2.resize(image_rgb, (320, 240))
+    results = face_mesh.process(small_rgb)
+    if not results.multi_face_landmarks:
+        logging.debug("Nema face landmarks detected.")
+        return None
+    h_orig, w_orig = image_rgb.shape[:2]
+    h_small, w_small = small_rgb.shape[:2]
+    scale_x = w_orig / w_small
+    scale_y = h_orig / h_small
+    mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
+    landmarks = results.multi_face_landmarks[0].landmark
+    points = [(int(lm.x * w_small * scale_x), int(lm.y * h_small * scale_y)) for lm in landmarks]
+    hull = cv2.convexHull(np.array(points))
+    cv2.fillConvexPoly(mask, hull, 255)
+    segmented_face = cv2.bitwise_and(image_rgb, image_rgb, mask=mask)
+    return segmented_face
+
+
+def should_classify(node_id, new_embedding):
+    current_time = datetime.now()
+
+    if node_id not in last_embedding_per_node:
+        last_embedding_per_node[node_id] = new_embedding
+        last_timestamp_per_node[node_id] = current_time
+        return True
+
+    prev_embedding = last_embedding_per_node[node_id]
+    dist = cosine_distance(new_embedding, prev_embedding)
+
+    if dist > THRESHOLD_DISTANCE:
+        last_embedding_per_node[node_id] = new_embedding
+        last_timestamp_per_node[node_id] = current_time
+        return True
+
+    prev_time = last_timestamp_per_node[node_id]
+    if current_time - prev_time > THRESHOLD_TIME:
+        last_timestamp_per_node[node_id] = current_time
+        return True
+
+    return False
+
+
+TOO_DARK_THRESHOLD = 20
+TOO_DARK_CONSEC_FRAMES = 10
+too_dark_counter = 0
+frame_count = 0
+start_time = time.time()
+latency_measurements = []
+
+
+def is_too_dark(gray_frame):
+    global too_dark_counter
+    avg_brightness = np.mean(gray_frame)
+    if avg_brightness < TOO_DARK_THRESHOLD:
+        too_dark_counter += 1
+    else:
+        too_dark_counter = 0
+    return too_dark_counter >= TOO_DARK_CONSEC_FRAMES
+
+
+cap = cv2.VideoCapture(1)
+
+try:
+    local_time = datetime.now().astimezone()
+    timezone_name = local_time.tzname()
+    logging.info(f"Node {NODE_ID} timezone: {timezone_name}")
+except Exception as e:
+    logging.error(f"Greška pri dohvaćanju timezone informacija: {e}")
+
+# === Health check kamere ===
+MAX_RETRIES = 500
+RETRY_DELAY = 1
+
+for attempt in range(MAX_RETRIES):
+    health_check_ret, health_check_frame = cap.read()
+    if health_check_ret and health_check_frame is not None and health_check_frame.size != 0:
+        avg_brightness = np.mean(cv2.cvtColor(health_check_frame, cv2.COLOR_BGR2GRAY))
+        if avg_brightness < TOO_DARK_THRESHOLD:
+            logging.warning(f"HEALTH CHECK: Inicijalni frame je pretaman (avg_brightness={avg_brightness:.2f}).")
+        else:
+            logging.info("HEALTH CHECK: Kamera uspješno prošla inicijalni test.")
+        break
+    else:
+        logging.info(f"HEALTH CHECK: Čekanje na aktivaciju kamere... (pokušaj {attempt + 1}/{MAX_RETRIES})")
+        time.sleep(RETRY_DELAY)
+else:
+    logging.critical("HEALTH CHECK: Kamera nije dohvatila validan frame ni nakon više pokušaja. Node se gasi.")
+    cap.release()
+    exit(1)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+if not cap.isOpened():
+    logging.error("Kamera se nije mogla otvoriti.")
+    exit(1)
+
+logging.info("Node pokrenut. Spreman za obradu...")
+
+while True:
+    frame_start = time.time()
+    ret, frame = cap.read()
+    if not ret:
+        logging.warning("Nisam uspio dohvatiti frame.")
+        continue
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if is_too_dark(gray):
+        logging.warning("It's too dark — kamera ne vidi gotovo ništa.")
+        cv2.putText(frame, "Too damn dark!", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+
+    if len(faces) == 0:
+        logging.debug("Nema lica u frameu.")
+
+    for (x, y, w, h) in faces:
+        face = frame[y:y + h, x:x + w]
+        if face.size == 0:
+            logging.debug("Izdvojeno lice ima size 0.")
+            continue
+
+        face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        segmented_face = segment_face(face_rgb)
+        if segmented_face is None:
+            logging.debug("Segmentacija lica nije uspjela.")
+            continue
+
+        inputs = processor(images=segmented_face, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = model.get_image_features(**inputs)
+        embedding = outputs.cpu().numpy().flatten()
+        embedding /= np.linalg.norm(embedding)
+
+        logging.debug(f"Embedding shape: {embedding.shape}, first 5: {embedding[:5]}")
+        logging.debug(f"Embedding norm: {np.linalg.norm(embedding)}")
+
+        if should_classify(NODE_ID, embedding):
+            data = {
+                "embedding": embedding.tolist(),
+                "node_id": NODE_ID,
+                "token": TOKEN,
+                "retries": 0,
+                "timezone": timezone_name,
+            }
+
+            try:
+                json_data = json.dumps(data)
+                redis_client.lpush("embedding_queue", json_data)
+                queue_size = redis_client.llen("embedding_queue")
+                logging.info(f"Embedding poslan u Redis queue. Queue size: {queue_size}")
+                logging.debug(f"JSON podatak: {json_data[:200]}...")
+            except Exception as e:
+                logging.error(f"Greska pri slanju u Redis: {e}")
+
+        with last_message_lock:
+            display_message = last_message
+
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(frame, display_message, (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    frame_end = time.time()
+    latency = frame_end - frame_start
+    latency_measurements.append(latency)
+    frame_count += 1
+
+    if frame_count % 30 == 0:
+        elapsed_time = frame_end - start_time
+        fps = frame_count / elapsed_time
+        avg_latency = sum(latency_measurements) / len(latency_measurements)
+        log_line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - FPS: {fps:.2f}, Latencija: {avg_latency * 1000:.2f} ms"
+        logging.info(log_line)
+
+        try:
+            with open("latency_log_node_0.txt", "a") as latency_file:
+                latency_file.write(log_line + "\n")
+        except Exception as e:
+            logging.error(f"Greska pri pisanju u latency_log.txt: {e}")
+
+        frame_count = 0
+        start_time = time.time()
+        latency_measurements = []
+
+    cv2.imshow("Distributed CV Node", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        logging.info("Prekid programa.")
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+logging.info("Node clean shutdown.")
