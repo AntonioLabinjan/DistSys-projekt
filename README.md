@@ -2,7 +2,7 @@ Distribuirani sustav za real-time prepoznavanje lica.
 
 - Fakultet Informatike u Puli
 
-- Student: Antonio Labinjan
+- Student: Antonio Labinjan, bacc. inf.
 - Mentor: doc. dr. sc. Nikola Tanković
 - Kolegij: Raspodijeljeni sustavi
 - Ak.god.: 2025/26
